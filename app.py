@@ -5,8 +5,8 @@ from datetime import date, datetime
 # -------------------------
 # CONFIG — change for your project
 # -------------------------
-BUCKET_NAME = "photos"   # <- your bucket name
-PROJECT_OPTIONS = ["Site A", "Site B", "Demo Project"]  # <- replace with your projects
+BUCKET_NAME = "daily-report-photos"   # <- your bucket name
+PROJECT_OPTIONS = ["Site A", "Site B", "Demo Project"]  # <- your projects
 
 # -------------------------
 # INIT: Supabase client
@@ -84,50 +84,30 @@ def upload_photo_to_bucket(st_file, project_name: str, report_date: date) -> str
     file_bytes = st_file.getvalue()
     content_type = st_file.type or "application/octet-stream"
     res = supabase.storage.from_(BUCKET_NAME).upload(
-        path,
-        file_bytes,
-        file_options={"content-type": content_type, "upsert": False},
+        path, file_bytes, file_options={"content-type": content_type, "upsert": False}
     )
-    # supabase-py returns a response object; if it has status_code >= 400, treat as error
     if hasattr(res, "status_code") and res.status_code and res.status_code >= 400:
         raise RuntimeError(f"Upload failed: {res}")
     return supabase.storage.from_(BUCKET_NAME).get_public_url(path)
 
 # -------------------------
-# SESSION DEFAULTS & RESET
+# FORM KEYS & RESET
 # -------------------------
-def ensure_defaults():
-    defaults = {
-        "date": date.today(),
-        "project": PROJECT_OPTIONS[0],
-        "weather": "",
-        "author": "",
-        "crew_text": "",
-        "equip_text": "",
-        "activities_text": "",
-        "quantities_text": "",
-        "subs_text": "",
-        "safety_text": "",
-        "issues_text": "",
-        "notes_raw": "",
-        "nonce": 0,  # used to reset file_uploader
-    }
-    for k, v in defaults.items():
-        if k not in st.session_state:
-            st.session_state[k] = v
+FORM_KEYS = [
+    "f_date", "f_project", "f_weather", "f_author", "f_crew_text", "f_equip_text",
+    "f_activities_text", "f_quantities_text", "f_subs_text", "f_safety_text",
+    "f_issues_text", "f_notes_raw"
+]
+
+if "nonce" not in st.session_state:
+    st.session_state["nonce"] = 0   # for file_uploader reset
 
 def clear_form():
-    st.session_state["date"] = date.today()
-    st.session_state["project"] = PROJECT_OPTIONS[0]
-    for k in [
-        "weather", "author", "crew_text", "equip_text", "activities_text",
-        "quantities_text", "subs_text", "safety_text", "issues_text", "notes_raw"
-    ]:
-        st.session_state[k] = ""
-    # Important: bump nonce so file_uploader gets a brand-new key and clears
+    # Remove all widget values; on rerun they re-init to defaults
+    for k in FORM_KEYS:
+        st.session_state.pop(k, None)
+    # bump uploader nonce so it becomes a fresh widget
     st.session_state["nonce"] += 1
-
-ensure_defaults()
 
 # -------------------------
 # UI: Form
@@ -135,42 +115,44 @@ ensure_defaults()
 with st.form("daily_form", clear_on_submit=False):
     col1, col2 = st.columns(2)
     with col1:
-        report_date = st.date_input("Date", value=st.session_state["date"], key="date")
+        report_date = st.date_input("Date", value=date.today(), key="f_date")
     with col2:
-        # use index based on current project
-        idx = PROJECT_OPTIONS.index(st.session_state["project"]) if st.session_state["project"] in PROJECT_OPTIONS else 0
-        project = st.selectbox("Project", PROJECT_OPTIONS, index=idx, key="project")
+        # default to first item if no previous choice
+        current_idx = 0
+        if "f_project" in st.session_state and st.session_state["f_project"] in PROJECT_OPTIONS:
+            current_idx = PROJECT_OPTIONS.index(st.session_state["f_project"])
+        project = st.selectbox("Project", PROJECT_OPTIONS, index=current_idx, key="f_project")
 
-    weather = st.text_input("Weather (free text)", placeholder="Sunny, 75°F, light wind", key="weather")
-    author = st.text_input("Author", placeholder="Jane Superintendent", key="author")
+    weather = st.text_input("Weather (free text)", placeholder="Sunny, 75°F, light wind", key="f_weather")
+    author = st.text_input("Author", placeholder="Jane Superintendent", key="f_author")
 
     st.markdown("**Crew counts** *(Trade:Count, Trade:Count)*")
-    crew_text = st.text_area("e.g., Carpenters:6, Ironworkers:4", height=60, key="crew_text")
+    crew_text = st.text_area("e.g., Carpenters:6, Ironworkers:4", height=60, key="f_crew_text")
 
     st.markdown("**Equipment** *(Type:Count, Type:Count)*")
-    equip_text = st.text_area("e.g., Excavator:2, Telehandler:1", height=60, key="equip_text")
+    equip_text = st.text_area("e.g., Excavator:2, Telehandler:1", height=60, key="f_equip_text")
 
     st.markdown("**Activities (free text or bullets)**")
-    activities_text = st.text_area("e.g., Formed footings at Grid A; Poured slab at Area 3", height=90, key="activities_text")
+    activities_text = st.text_area("e.g., Formed footings at Grid A; Poured slab at Area 3", height=90, key="f_activities_text")
 
     st.markdown("**Quantities** *(one per line: Item [Unit]: Value)*")
-    quantities_text = st.text_area("e.g., Concrete CY: 35\nLF curb: 120", height=80, key="quantities_text")
+    quantities_text = st.text_area("e.g., Concrete CY: 35\nLF curb: 120", height=80, key="f_quantities_text")
 
-    subs_text = st.text_input("Subcontractors present (comma-separated)", placeholder="ACME Paving, XYZ Steel", key="subs_text")
-    safety_text = st.text_area("Safety observations", height=80, key="safety_text")
-    issues_text = st.text_area("Issues / delays", height=80, key="issues_text")
+    subs_text = st.text_input("Subcontractors present (comma-separated)", placeholder="ACME Paving, XYZ Steel", key="f_subs_text")
+    safety_text = st.text_area("Safety observations", height=80, key="f_safety_text")
+    issues_text = st.text_area("Issues / delays", height=80, key="f_issues_text")
 
-    # IMPORTANT: dynamic key so the uploader resets when nonce changes
+    # File uploader with dynamic key so it resets after submit
     photos = st.file_uploader(
         "Photos",
         type=["jpg", "jpeg", "png"],
         accept_multiple_files=True,
-        key=f"photos_{st.session_state['nonce']}",
+        key=f"f_photos_{st.session_state['nonce']}",
     )
 
-    notes_raw = st.text_area("Raw notes (optional)", placeholder="Paste any raw notes here", height=80, key="notes_raw")
+    notes_raw = st.text_area("Raw notes (optional)", placeholder="Paste any raw notes here", height=80, key="f_notes_raw")
 
-    # ✅ Submit button (inside the form)
+    # Submit button
     submitted = st.form_submit_button("Submit report")
 
 if submitted:
@@ -180,35 +162,35 @@ if submitted:
         if photos:
             for p in photos:
                 try:
-                    url = upload_photo_to_bucket(p, st.session_state["project"], st.session_state["date"])
+                    url = upload_photo_to_bucket(p, project, report_date)
                     photo_urls.append(url)
                 except Exception as e:
                     st.warning(f"Photo upload failed for {p.name}: {e}")
 
         # 2) Build structured payload
-        crew_counts = kvlist_to_json(st.session_state["crew_text"], crew_hint=True)
-        equipment = kvlist_to_json(st.session_state["equip_text"])
+        crew_counts = kvlist_to_json(crew_text, crew_hint=True)
+        equipment = kvlist_to_json(equip_text)
         activities = []
-        if st.session_state["activities_text"].strip():
-            parts = [x.strip() for x in st.session_state["activities_text"].replace("\n", ";").split(";") if x.strip()]
+        if activities_text.strip():
+            parts = [x.strip() for x in activities_text.replace("\n", ";").split(";") if x.strip()]
             activities = [{"location": "", "description": p} for p in parts]
-        quantities = qty_to_json(st.session_state["quantities_text"])
-        subs_present = str_to_list(st.session_state["subs_text"])
+        quantities = qty_to_json(quantities_text)
+        subs_present = str_to_list(subs_text)
 
         row = {
-            "date": st.session_state["date"].isoformat(),
-            "project": st.session_state["project"],
-            "author": st.session_state["author"],
-            "weather": st.session_state["weather"],
+            "date": report_date.isoformat(),
+            "project": project,
+            "author": author,
+            "weather": weather,
             "crew_counts": crew_counts,
             "equipment": equipment,
             "activities": activities,
             "quantities": quantities,
             "subs_present": subs_present,   # jsonb recommended
-            "issues_delays": st.session_state["issues_text"],
-            "safety": st.session_state["safety_text"],
+            "issues_delays": issues_text,
+            "safety": safety_text,
             "photos": photo_urls,           # jsonb recommended
-            "notes_raw": st.session_state["notes_raw"],
+            "notes_raw": notes_raw,
             "doc_url": "",
         }
 
@@ -216,8 +198,7 @@ if submitted:
         try:
             supabase.table("daily_reports").insert(row).execute()
             st.success("✅ Report saved to Supabase.")
-            # 4) Clear inputs AFTER successful insert
             clear_form()
-            st.rerun()  # re-render with cleared state + new uploader key
+            st.rerun()  # re-render with cleared state and a fresh uploader key
         except Exception as e:
             st.error(f"❌ Could not insert row: {e}")
