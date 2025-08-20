@@ -5,7 +5,7 @@ from datetime import date, datetime
 # -------------------------
 # CONFIG — change for your project
 # -------------------------
-BUCKET_NAME = "daily-report-photos"   # <- your bucket
+BUCKET_NAME = "photos"   # <- your bucket
 PROJECT_OPTIONS = ["Site A", "Site B", "Demo Project"]  # <- your projects
 
 # -------------------------
