@@ -5,8 +5,8 @@ from datetime import date, datetime
 # -------------------------
 # CONFIG — change for your project
 # -------------------------
-BUCKET_NAME = "photos"   # <- your bucket
-PROJECT_OPTIONS = ["Site A", "Site B", "Demo Project"]  # <- your projects
+BUCKET_NAME = "photos"   # <- your bucket name
+PROJECT_OPTIONS = ["Site A", "Site B", "Demo Project"]  # <- replace with your projects
 
 # -------------------------
 # INIT: Supabase client
@@ -51,9 +51,7 @@ def kvlist_to_json(s: str, kv_sep=":", item_sep=",", crew_hint=False):
                     num = float(v)
                 except:
                     num = v
-            out.append(
-                {"trade" if crew_hint else "type": k, "count": num}
-            )
+            out.append({"trade" if crew_hint else "type": k, "count": num})
     return out
 
 def qty_to_json(s: str):
@@ -84,17 +82,19 @@ def upload_photo_to_bucket(st_file, project_name: str, report_date: date) -> str
     name = st_file.name
     path = f"{report_date.isoformat()}/{safe_proj}/{ts}_{name}".replace(" ", "_")
     file_bytes = st_file.getvalue()
-    # Optional: set content-type from upload
     content_type = st_file.type or "application/octet-stream"
     res = supabase.storage.from_(BUCKET_NAME).upload(
-        path, file_bytes, file_options={"content-type": content_type, "upsert": False}
+        path,
+        file_bytes,
+        file_options={"content-type": content_type, "upsert": False},
     )
-    if hasattr(res, "status_code") and res.status_code >= 400:
+    # supabase-py returns a response object; if it has status_code >= 400, treat as error
+    if hasattr(res, "status_code") and res.status_code and res.status_code >= 400:
         raise RuntimeError(f"Upload failed: {res}")
     return supabase.storage.from_(BUCKET_NAME).get_public_url(path)
 
 # -------------------------
-# DEFAULTS & SESSION KEYS
+# SESSION DEFAULTS & RESET
 # -------------------------
 def ensure_defaults():
     defaults = {
@@ -110,7 +110,7 @@ def ensure_defaults():
         "safety_text": "",
         "issues_text": "",
         "notes_raw": "",
-        "photos": None,
+        "nonce": 0,  # used to reset file_uploader
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -124,7 +124,8 @@ def clear_form():
         "quantities_text", "subs_text", "safety_text", "issues_text", "notes_raw"
     ]:
         st.session_state[k] = ""
-    st.session_state["photos"] = None
+    # Important: bump nonce so file_uploader gets a brand-new key and clears
+    st.session_state["nonce"] += 1
 
 ensure_defaults()
 
@@ -136,7 +137,9 @@ with st.form("daily_form", clear_on_submit=False):
     with col1:
         report_date = st.date_input("Date", value=st.session_state["date"], key="date")
     with col2:
-        project = st.selectbox("Project", PROJECT_OPTIONS, index=PROJECT_OPTIONS.index(st.session_state["project"]), key="project")
+        # use index based on current project
+        idx = PROJECT_OPTIONS.index(st.session_state["project"]) if st.session_state["project"] in PROJECT_OPTIONS else 0
+        project = st.selectbox("Project", PROJECT_OPTIONS, index=idx, key="project")
 
     weather = st.text_input("Weather (free text)", placeholder="Sunny, 75°F, light wind", key="weather")
     author = st.text_input("Author", placeholder="Jane Superintendent", key="author")
@@ -157,17 +160,25 @@ with st.form("daily_form", clear_on_submit=False):
     safety_text = st.text_area("Safety observations", height=80, key="safety_text")
     issues_text = st.text_area("Issues / delays", height=80, key="issues_text")
 
-    photos = st.file_uploader("Photos", type=["jpg","jpeg","png"], accept_multiple_files=True, key="photos")
+    # IMPORTANT: dynamic key so the uploader resets when nonce changes
+    photos = st.file_uploader(
+        "Photos",
+        type=["jpg", "jpeg", "png"],
+        accept_multiple_files=True,
+        key=f"photos_{st.session_state['nonce']}",
+    )
+
     notes_raw = st.text_area("Raw notes (optional)", placeholder="Paste any raw notes here", height=80, key="notes_raw")
 
+    # ✅ Submit button (inside the form)
     submitted = st.form_submit_button("Submit report")
 
 if submitted:
     with st.spinner("Uploading photos and saving report..."):
         # 1) Upload photos (if any)
         photo_urls = []
-        if st.session_state["photos"]:
-            for p in st.session_state["photos"]:
+        if photos:
+            for p in photos:
                 try:
                     url = upload_photo_to_bucket(p, st.session_state["project"], st.session_state["date"])
                     photo_urls.append(url)
@@ -207,5 +218,6 @@ if submitted:
             st.success("✅ Report saved to Supabase.")
             # 4) Clear inputs AFTER successful insert
             clear_form()
+            st.rerun()  # re-render with cleared state + new uploader key
         except Exception as e:
             st.error(f"❌ Could not insert row: {e}")
