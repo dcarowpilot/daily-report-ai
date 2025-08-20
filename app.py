@@ -7,7 +7,7 @@ import io
 # -------------------------
 # CONFIG — change for your project
 # -------------------------
-BUCKET_NAME = "daily-report-photos"   # <- put your bucket name here
+BUCKET_NAME = "photos"   # <- put your bucket name here
 PROJECT_OPTIONS = ["Site A", "Site B", "Demo Project"]  # <- change to your real projects
 
 # -------------------------
