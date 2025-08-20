@@ -2,16 +2,21 @@ import streamlit as st
 import os
 from supabase import create_client
 
-# Load secrets
-OPENAI_API_KEY = st.secrets["OPENAI_API_KEY"]
-SUPABASE_URL = st.secrets["SUPABASE_URL"]
-SUPABASE_KEY = st.secrets["SUPABASE_KEY"]
 
-# Example: set OpenAI env var
-os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
+st.title("Daily Report AI – Env Test")
 
-# Example: connect to Supabase
-supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+# Make sure you added these in Streamlit -> App -> Settings -> Secrets
+try:
+    url = st.secrets["SUPABASE_URL"]
+    key = st.secrets["SUPABASE_KEY"]
+    st.write("✅ Secrets loaded.")
+except Exception as e:
+    st.error("❌ Could not load SUPABASE_URL / SUPABASE_KEY from Secrets.")
+    st.stop()
 
-st.title("Daily Report AI")
-st.write("Hello, world! This is your starter appzz.")
+# Try to import and connect
+try:
+    supabase = create_client(url, key)
+    st.success("✅ Supabase client imported and initialized.")
+except Exception as e:
+    st.error(f"❌ Supabase init failed: {e}")
