@@ -2,49 +2,37 @@ import streamlit as st
 from supabase import create_client
 from datetime import date, datetime
 from openai import OpenAI
-import tempfile
 from st_audiorec import st_audiorec
+import tempfile
 
-
-
-
-
-
-# -------------------------
-# CONFIG — change for your project
-# -------------------------
-BUCKET_PHOTOS = "daily-report-photos"       # your photos bucket
-BUCKET_AUDIO  = "daily-report-audio"        # new audio bucket
+# =========================
+# CONFIG (edit these)
+# =========================
+BUCKET_PHOTOS = "daily-report-photos"
+BUCKET_AUDIO  = "daily-report-audio"
 PROJECT_OPTIONS = ["Site A", "Site B", "Demo Project"]
 
-
-
-
-
-
-# -------------------------
-# INIT: Supabase + OpenAI
-# -------------------------
+# =========================
+# INIT CLIENTS
+# =========================
 @st.cache_resource
 def get_supabase():
-    url = st.secrets["SUPABASE_URL"]
-    key = st.secrets["SUPABASE_KEY"]
-    return create_client(url, key)
+    return create_client(st.secrets["SUPABASE_URL"], st.secrets["SUPABASE_KEY"])
 
 @st.cache_resource
 def get_openai():
     return OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
 
 supabase = get_supabase()
-client = get_openai()
+openai_client = get_openai()
 
 st.set_page_config(page_title="Daily Report AI", page_icon="📝")
 st.title("📝 Daily Report (MVP)")
-st.caption("Record → (try) Whisper → review transcript • Photos/Audio → Supabase • Data → daily_reports")
+st.caption("Record → Whisper → review transcript • Photos/Audio → Supabase • Data → daily_reports")
 
-# -------------------------
-# Session for resetting form / holding audio+transcript
-# -------------------------
+# =========================
+# SESSION
+# =========================
 if "nonce" not in st.session_state:
     st.session_state["nonce"] = 0
 if "recorded_audio" not in st.session_state:
@@ -57,19 +45,17 @@ def reset_all_fields():
     st.session_state["recorded_audio"] = None
     st.session_state["transcript"] = ""
 
-# -------------------------
-# Helpers
-# -------------------------
+# =========================
+# HELPERS
+# =========================
 def str_to_list(s: str):
-    if not s or not s.strip():
-        return []
+    if not s or not s.strip(): return []
     parts = [p.strip() for p in s.replace("\n", ",").replace(";", ",").split(",")]
     return [p for p in parts if p]
 
 def kvlist_to_json(s: str, kv_sep=":", item_sep=",", crew_hint=False):
     out = []
-    if not s or not s.strip():
-        return out
+    if not s or not s.strip(): return out
     items = [x.strip() for x in s.replace("\n", item_sep).split(item_sep) if x.strip()]
     for it in items:
         if kv_sep in it:
@@ -83,8 +69,7 @@ def kvlist_to_json(s: str, kv_sep=":", item_sep=",", crew_hint=False):
 
 def qty_to_json(s: str):
     out = []
-    if not s or not s.strip():
-        return out
+    if not s or not s.strip(): return out
     for line in [x.strip() for x in s.splitlines() if x.strip()]:
         if ":" not in line: continue
         left, val = [x.strip() for x in line.split(":", 1)]
@@ -99,14 +84,25 @@ def qty_to_json(s: str):
     return out
 
 def upload_bytes_to_bucket(bucket: str, path: str, data: bytes, content_type: str) -> str:
-    res = supabase.storage.from_(bucket).upload(
-        path, data, file_options={"content-type": content_type, "upsert": False}
-    )
-    if hasattr(res, "status_code") and res.status_code and res.status_code >= 400:
-        raise RuntimeError(f"Upload failed: {res}")
-    return supabase.storage.from_(bucket).get_public_url(path)
+    """Uploads bytes to Supabase Storage; returns public URL or ''."""
+    try:
+        res = supabase.storage.from_(bucket).upload(
+            path,
+            data,
+            file_options={
+                "content-type": content_type,   # must be string
+                "upsert": "true",               # string, not bool
+            },
+        )
+        status = getattr(res, "status_code", None)
+        if status and status >= 400:
+            raise RuntimeError(f"Upload failed {status}: {getattr(res, 'message', '')}")
+        return supabase.storage.from_(bucket).get_public_url(path)
+    except Exception as e:
+        st.warning(f"Upload error for {bucket}/{path}: {e}")
+        return ""
 
-def upload_photo_to_bucket(st_file, project_name: str, report_date: date) -> str:
+def upload_photo(st_file, project_name: str, report_date: date) -> str:
     safe_proj = project_name.replace("/", "-")
     ts = int(datetime.utcnow().timestamp())
     name = st_file.name.replace(" ", "_")
@@ -116,65 +112,35 @@ def upload_photo_to_bucket(st_file, project_name: str, report_date: date) -> str
     )
 
 def upload_audio_bytes(project_name: str, report_date: date, wav_bytes: bytes) -> str:
-    """Uploads recorded WAV bytes; returns public URL (or '' if None)."""
-    if not wav_bytes:
-        return ""
+    if not wav_bytes: return ""
     safe_proj = project_name.replace("/", "-")
     ts = int(datetime.utcnow().timestamp())
     path = f"{report_date.isoformat()}/{safe_proj}/{ts}_voice.wav"
     return upload_bytes_to_bucket(BUCKET_AUDIO, path, wav_bytes, "audio/wav")
 
-def transcribe_wav_bytes(wav_bytes: bytes) -> tuple[str, str]:
-    """
-    Try Whisper; return (text, err_code).
-    err_code can be '', 'insufficient_quota', or 'other'.
-    """
-    if not wav_bytes:
-        return "", ""
+def transcribe_wav_bytes(wav_bytes: bytes) -> str:
+    """Send WAV bytes to Whisper and return transcript text."""
+    if not wav_bytes: return ""
     try:
         with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
             tmp.write(wav_bytes); tmp.flush()
             with open(tmp.name, "rb") as f:
-                resp = client.audio.transcriptions.create(model="whisper-1", file=f)
-        return (resp.text or ""), ""
+                resp = openai_client.audio.transcriptions.create(model="whisper-1", file=f)
+        return resp.text or ""
     except Exception as e:
-        msg = str(e)
-        if "insufficient_quota" in msg or "429" in msg:
-            st.warning("Transcription skipped: OpenAI quota not available. Audio will be saved for later.")
-            return "", "insufficient_quota"
         st.warning(f"Transcription failed: {e}")
-        return "", "other"
-def upload_bytes_to_bucket(bucket: str, path: str, data: bytes, content_type: str) -> str:
-    """Uploads bytes to a Supabase Storage bucket; returns public URL or '' on failure."""
-    try:
-        res = supabase.storage.from_(bucket).upload(
-            path,
-            data,
-            file_options={
-                "content-type": content_type,   # must be a string
-                "upsert": "true",               # <-- string, not bool
-                # "cache-control": "3600",      # optional example; also string
-            },
-        )
-        status = getattr(res, "status_code", None)
-        if status and status >= 400:
-            raise RuntimeError(f"Upload failed with status {status}: {getattr(res, 'message', '')}")
-        return supabase.storage.from_(bucket).get_public_url(path)
-    except Exception as e:
-        st.warning(f"Upload error for {bucket}/{path}: {e}")
         return ""
-# -------------------------
-# 🎙️ Recorder + Transcript Box
-# -------------------------
+
+# =========================
+# RECORDER + TRANSCRIPT
+# =========================
 st.subheader("🎙️ Voice note (optional)")
 st.caption("Tap to record, speak, tap again to stop. Edit the transcript before submit.")
 
 recorded_bytes = st_audiorec()
 if recorded_bytes and recorded_bytes != st.session_state.get("recorded_audio"):
     st.session_state["recorded_audio"] = recorded_bytes
-    # Try to transcribe immediately so the box is prefilled
-    text, err = transcribe_wav_bytes(recorded_bytes)
-    st.session_state["transcript"] = text or ""
+    st.session_state["transcript"] = transcribe_wav_bytes(recorded_bytes) or ""
 
 cols = st.columns([1,1,3])
 with cols[0]:
@@ -187,35 +153,18 @@ with cols[1]:
             st.session_state["transcript"] = ""
             st.rerun()
 
-# Editable transcript (may be empty if quota error)
 st.text_area(
     "Transcribed audio (editable)",
     key="transcript",
     height=120,
-    placeholder="Transcript will appear here after recording… (or leave empty if transcription skipped)",
+    placeholder="Transcript will appear here after recording…",
 )
 
 st.divider()
-# ---- Temporary storage test button ----
-if st.button("Test audio bucket write"):
-    test_path = f"test/{int(datetime.utcnow().timestamp())}_hello.txt"
-    try:
-        url = upload_bytes_to_bucket(
-            BUCKET_AUDIO,
-            test_path,
-            b"hello audio bucket",
-            "text/plain"
-        )
-        if url:
-            st.success(f"✅ Audio bucket write OK: {url}")
-        else:
-            st.error("❌ Audio bucket write FAILED. Check bucket name & storage policies.")
-    except Exception as e:
-        st.error(f"❌ Exception during test upload: {e}")
-# ---------------------------------------
-# -------------------------
-# UI: Form (dynamic key resets after save)
-# -------------------------
+
+# =========================
+# FORM (dynamic key so it resets)
+# =========================
 FORM_KEY = f"daily_form_{st.session_state['nonce']}"
 
 with st.form(FORM_KEY, clear_on_submit=False):
@@ -254,21 +203,20 @@ with st.form(FORM_KEY, clear_on_submit=False):
     submitted = st.form_submit_button("Submit report")
 
 if submitted:
-    with st.spinner("Saving audio/photos and inserting report..."):
-        # Upload audio regardless of transcription outcome
+    with st.spinner("Uploading media and saving report..."):
+        # Upload audio (even if transcript failed/empty)
         audio_url = upload_audio_bytes(project, report_date, st.session_state.get("recorded_audio"))
 
-        # 1) Upload photos
+        # Upload photos
         photo_urls = []
         if photos:
             for p in photos:
                 try:
-                    url = upload_photo_to_bucket(p, project, report_date)
-                    photo_urls.append(url)
+                    photo_urls.append(upload_photo(p, project, report_date))
                 except Exception as e:
                     st.warning(f"Photo upload failed for {p.name}: {e}")
 
-        # 2) Build row
+        # Build row
         crew_counts = kvlist_to_json(crew_text, crew_hint=True)
         equipment = kvlist_to_json(equip_text)
         activities = []
@@ -299,7 +247,7 @@ if submitted:
 
         try:
             supabase.table("daily_reports").insert(row).execute()
-            st.success("✅ Report saved. (Transcription used if available; audio stored either way.)")
+            st.success("✅ Report saved (with photos/audio + transcript).")
             reset_all_fields()
             st.rerun()
         except Exception as e:
