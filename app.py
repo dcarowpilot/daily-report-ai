@@ -38,10 +38,10 @@ if "nonce" not in st.session_state:
 if "recorded_audio" not in st.session_state:
     st.session_state["recorded_audio"] = None
 if "transcript_prefill" not in st.session_state:
-    st.session_state["transcript_prefill"] = ""   # NOT a widget key; safe to set anytime
+    st.session_state["transcript_prefill"] = ""   # safe prefill holder (not a widget key)
 
 def reset_all_fields():
-    # Don’t write to widget keys; just bump nonce to rebuild widgets fresh
+    """Reset recorder + transcript and rebuild all widgets by bumping nonce."""
     st.session_state["recorded_audio"] = None
     st.session_state["transcript_prefill"] = ""
     st.session_state["nonce"] += 1
@@ -130,15 +130,17 @@ def transcribe_wav_bytes(wav_bytes: bytes) -> str:
         return ""
 
 # =========================
-# RECORDER + TRANSCRIPT
+# RECORDER + TRANSCRIPT (both tied to nonce)
 # =========================
 st.subheader("🎙️ Voice note (optional)")
 st.caption("Tap to record, speak, tap again to stop. Edit the transcript before submit.")
 
-recorded_bytes = st_audiorec()
+# Recorder resets when nonce changes
+recorded_bytes = st_audiorec(key=f"rec_{st.session_state['nonce']}")
+
 if recorded_bytes and recorded_bytes != st.session_state.get("recorded_audio"):
     st.session_state["recorded_audio"] = recorded_bytes
-    # Set prefill (safe – not a widget key)
+    # Set transcript prefill (safe; not a widget key)
     st.session_state["transcript_prefill"] = transcribe_wav_bytes(recorded_bytes) or ""
 
 cols = st.columns([1,1,3])
@@ -151,7 +153,7 @@ with cols[1]:
             reset_all_fields()
             st.rerun()
 
-# Editable transcript with dynamic key; we read the returned value
+# Transcript text area uses dynamic key tied to nonce; we read returned value
 transcript_text = st.text_area(
     "Transcribed audio (editable)",
     value=st.session_state.get("transcript_prefill", ""),
@@ -245,7 +247,7 @@ if submitted:
         try:
             supabase.table("daily_reports").insert(row).execute()
             st.success("✅ Report saved (with photos/audio + transcript).")
-            reset_all_fields()
+            reset_all_fields()     # clears recorder + transcript + form via nonce
             st.rerun()
         except Exception as e:
             st.error(f"❌ Could not insert row: {e}")
