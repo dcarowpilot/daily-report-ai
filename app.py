@@ -8,8 +8,8 @@ from pathlib import Path
 # -------------------------
 # CONFIG — change for your project
 # -------------------------
-BUCKET_NAME = "daily-report-photos"          # <- your bucket name
-PROJECT_OPTIONS = ["Site A", "Site B", "Demo Project"]  # <- your projects
+BUCKET_NAME = "photos"          # <- your bucket name
+PROJECT_OPTIONS = ["Site A", "Site B", "Demo Project", "Site C"]  # <- your projects
 
 # -------------------------
 # INIT: Supabase + OpenAI
