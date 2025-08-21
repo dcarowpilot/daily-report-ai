@@ -37,13 +37,14 @@ if "nonce" not in st.session_state:
     st.session_state["nonce"] = 0
 if "recorded_audio" not in st.session_state:
     st.session_state["recorded_audio"] = None
-if "transcript" not in st.session_state:
-    st.session_state["transcript"] = ""
+if "transcript_prefill" not in st.session_state:
+    st.session_state["transcript_prefill"] = ""   # NOT a widget key; safe to set anytime
 
 def reset_all_fields():
-    st.session_state["nonce"] += 1
+    # Don’t write to widget keys; just bump nonce to rebuild widgets fresh
     st.session_state["recorded_audio"] = None
-    st.session_state["transcript"] = ""
+    st.session_state["transcript_prefill"] = ""
+    st.session_state["nonce"] += 1
 
 # =========================
 # HELPERS
@@ -89,10 +90,7 @@ def upload_bytes_to_bucket(bucket: str, path: str, data: bytes, content_type: st
         res = supabase.storage.from_(bucket).upload(
             path,
             data,
-            file_options={
-                "content-type": content_type,   # must be string
-                "upsert": "true",               # string, not bool
-            },
+            file_options={"content-type": content_type, "upsert": "true"},
         )
         status = getattr(res, "status_code", None)
         if status and status >= 400:
@@ -140,7 +138,8 @@ st.caption("Tap to record, speak, tap again to stop. Edit the transcript before 
 recorded_bytes = st_audiorec()
 if recorded_bytes and recorded_bytes != st.session_state.get("recorded_audio"):
     st.session_state["recorded_audio"] = recorded_bytes
-    st.session_state["transcript"] = transcribe_wav_bytes(recorded_bytes) or ""
+    # Set prefill (safe – not a widget key)
+    st.session_state["transcript_prefill"] = transcribe_wav_bytes(recorded_bytes) or ""
 
 cols = st.columns([1,1,3])
 with cols[0]:
@@ -149,13 +148,14 @@ with cols[0]:
 with cols[1]:
     if st.session_state["recorded_audio"]:
         if st.button("Clear recording"):
-            st.session_state["recorded_audio"] = None
-            st.session_state["transcript"] = ""
+            reset_all_fields()
             st.rerun()
 
-st.text_area(
+# Editable transcript with dynamic key; we read the returned value
+transcript_text = st.text_area(
     "Transcribed audio (editable)",
-    key="transcript",
+    value=st.session_state.get("transcript_prefill", ""),
+    key=f"transcript_{st.session_state['nonce']}",
     height=120,
     placeholder="Transcript will appear here after recording…",
 )
@@ -204,10 +204,8 @@ with st.form(FORM_KEY, clear_on_submit=False):
 
 if submitted:
     with st.spinner("Uploading media and saving report..."):
-        # Upload audio (even if transcript failed/empty)
         audio_url = upload_audio_bytes(project, report_date, st.session_state.get("recorded_audio"))
 
-        # Upload photos
         photo_urls = []
         if photos:
             for p in photos:
@@ -216,7 +214,6 @@ if submitted:
                 except Exception as e:
                     st.warning(f"Photo upload failed for {p.name}: {e}")
 
-        # Build row
         crew_counts = kvlist_to_json(crew_text, crew_hint=True)
         equipment = kvlist_to_json(equip_text)
         activities = []
@@ -240,7 +237,7 @@ if submitted:
             "safety": safety_text,
             "photos": photo_urls,
             "notes_raw": notes_raw,
-            "voice_transcript": st.session_state.get("transcript", "") or "",
+            "voice_transcript": transcript_text,   # read from returned variable
             "audio_url": audio_url,
             "doc_url": "",
         }
