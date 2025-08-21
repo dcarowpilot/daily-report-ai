@@ -30,23 +30,7 @@ def get_supabase():
     url = st.secrets["SUPABASE_URL"]
     key = st.secrets["SUPABASE_KEY"]
     return create_client(url, key)
-# ---- Temporary storage test button ----
-if st.button("Test audio bucket write"):
-    test_path = f"test/{int(datetime.utcnow().timestamp())}_hello.txt"
-    try:
-        url = upload_bytes_to_bucket(
-            BUCKET_AUDIO,
-            test_path,
-            b"hello audio bucket",
-            "text/plain"
-        )
-        if url:
-            st.success(f"✅ Audio bucket write OK: {url}")
-        else:
-            st.error("❌ Audio bucket write FAILED. Check bucket name & storage policies.")
-    except Exception as e:
-        st.error(f"❌ Exception during test upload: {e}")
-# ---------------------------------------
+
 @st.cache_resource
 def get_openai():
     return OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
@@ -160,7 +144,21 @@ def transcribe_wav_bytes(wav_bytes: bytes) -> tuple[str, str]:
             return "", "insufficient_quota"
         st.warning(f"Transcription failed: {e}")
         return "", "other"
-
+def upload_bytes_to_bucket(bucket: str, path: str, data: bytes, content_type: str) -> str:
+    """Uploads bytes to a Supabase Storage bucket; returns public URL or '' on failure."""
+    try:
+        res = supabase.storage.from_(bucket).upload(
+            path,
+            data,
+            file_options={"content-type": content_type, "upsert": True},  # upsert=True avoids 409 errors
+        )
+        status = getattr(res, "status_code", None)
+        if status and status >= 400:
+            raise RuntimeError(f"Upload failed with status {status}: {getattr(res, 'message', '')}")
+        return supabase.storage.from_(bucket).get_public_url(path)
+    except Exception as e:
+        st.warning(f"Upload error for {bucket}/{path}: {e}")
+        return ""
 # -------------------------
 # 🎙️ Recorder + Transcript Box
 # -------------------------
@@ -194,7 +192,23 @@ st.text_area(
 )
 
 st.divider()
-
+# ---- Temporary storage test button ----
+if st.button("Test audio bucket write"):
+    test_path = f"test/{int(datetime.utcnow().timestamp())}_hello.txt"
+    try:
+        url = upload_bytes_to_bucket(
+            BUCKET_AUDIO,
+            test_path,
+            b"hello audio bucket",
+            "text/plain"
+        )
+        if url:
+            st.success(f"✅ Audio bucket write OK: {url}")
+        else:
+            st.error("❌ Audio bucket write FAILED. Check bucket name & storage policies.")
+    except Exception as e:
+        st.error(f"❌ Exception during test upload: {e}")
+# ---------------------------------------
 # -------------------------
 # UI: Form (dynamic key resets after save)
 # -------------------------
