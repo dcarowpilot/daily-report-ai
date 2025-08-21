@@ -4,12 +4,13 @@ from datetime import date, datetime
 from openai import OpenAI
 import tempfile
 from pathlib import Path
+from st_audiorec import st_audiorec  # <— mic recorder component
 
 # -------------------------
 # CONFIG — change for your project
 # -------------------------
-BUCKET_NAME = "photos"          # <- your bucket name
-PROJECT_OPTIONS = ["Site A", "Site B", "Demo Project", "Site C"]  # <- your projects
+BUCKET_NAME = "daily-report-photos"          # <- your bucket name
+PROJECT_OPTIONS = ["Site A", "Site B", "Demo Project"]  # <- your projects
 
 # -------------------------
 # INIT: Supabase + OpenAI
@@ -22,25 +23,26 @@ def get_supabase():
 
 @st.cache_resource
 def get_openai():
-    # OPENAI_API_KEY must be in Streamlit Secrets
-    return Client(api_key=st.secrets["OPENAI_API_KEY"]) if False else OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
+    return OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
 
 supabase = get_supabase()
 client = get_openai()
 
 st.set_page_config(page_title="Daily Report AI", page_icon="📝")
 st.title("📝 Daily Report (MVP)")
-st.caption("Crude but real: voice/text + photos → one structured row in Supabase.")
+st.caption("Voice → Whisper → appended to Notes • Photos → Supabase • Data → daily_reports")
 
 # -------------------------
-# Session: nonce to reset the whole form
+# Session: nonce to fully reset the form
 # -------------------------
 if "nonce" not in st.session_state:
     st.session_state["nonce"] = 0
+if "recorded_audio" not in st.session_state:
+    st.session_state["recorded_audio"] = None  # bytes of WAV
 
 def reset_all_fields():
-    """Bump nonce so the entire form + all child widgets reinitialize empty."""
     st.session_state["nonce"] += 1
+    st.session_state["recorded_audio"] = None
 
 # -------------------------
 # Helpers
@@ -104,17 +106,13 @@ def upload_photo_to_bucket(st_file, project_name: str, report_date: date) -> str
         raise RuntimeError(f"Upload failed: {res}")
     return supabase.storage.from_(BUCKET_NAME).get_public_url(path)
 
-def transcribe_audio(uploaded_audio) -> str:
-    """
-    Save the Streamlit UploadedFile to a temp file and call Whisper.
-    Returns transcript text (or "" on failure).
-    """
-    if not uploaded_audio:
+def transcribe_wav_bytes(wav_bytes: bytes) -> str:
+    """Send WAV bytes to Whisper and return transcript text."""
+    if not wav_bytes:
         return ""
     try:
-        suffix = Path(uploaded_audio.name).suffix or ".mp3"
-        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-            tmp.write(uploaded_audio.getvalue())
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
+            tmp.write(wav_bytes)
             tmp.flush()
             with open(tmp.name, "rb") as f:
                 resp = client.audio.transcriptions.create(
@@ -127,7 +125,32 @@ def transcribe_audio(uploaded_audio) -> str:
         return ""
 
 # -------------------------
-# UI: Form (dynamic key)
+# 🎙️ Recorder (outside the form)
+# -------------------------
+st.subheader("🎙️ Voice note (optional)")
+st.caption("Tap to record, speak, tap again to stop. The transcript will be appended to Notes.")
+
+recorded_bytes = st_audiorec()  # shows a round record/stop button; returns WAV bytes when stopped
+
+# Save to session when a fresh recording arrives
+if recorded_bytes and recorded_bytes != st.session_state.get("recorded_audio"):
+    st.session_state["recorded_audio"] = recorded_bytes
+    st.success("Captured voice note.")
+
+cols = st.columns([1,1,3])
+with cols[0]:
+    if st.session_state["recorded_audio"]:
+        st.audio(st.session_state["recorded_audio"], format="audio/wav")
+with cols[1]:
+    if st.session_state["recorded_audio"]:
+        if st.button("Clear recording"):
+            st.session_state["recorded_audio"] = None
+            st.rerun()
+
+st.divider()
+
+# -------------------------
+# UI: Form (dynamic key so it resets)
 # -------------------------
 FORM_KEY = f"daily_form_{st.session_state['nonce']}"
 
@@ -157,20 +180,11 @@ with st.form(FORM_KEY, clear_on_submit=False):
     safety_text = st.text_area("Safety observations", height=80)
     issues_text = st.text_area("Issues / delays", height=80)
 
-    # Photos
     photos = st.file_uploader(
         "Photos",
         type=["jpg", "jpeg", "png"],
         accept_multiple_files=True,
         key=f"photos_{st.session_state['nonce']}",
-    )
-
-    # 🎙️ Voice note (m4a/mp3/wav/webm work well)
-    audio = st.file_uploader(
-        "Voice note (optional)",
-        type=["m4a", "mp3", "wav", "webm"],
-        accept_multiple_files=False,
-        key=f"audio_{st.session_state['nonce']}",
     )
 
     notes_raw = st.text_area("Raw notes (optional)", placeholder="Paste any raw notes here", height=80)
@@ -179,12 +193,12 @@ with st.form(FORM_KEY, clear_on_submit=False):
 
 if submitted:
     with st.spinner("Transcribing, uploading photos, and saving report..."):
-        # 0) Transcribe voice (append to notes)
-        transcript = transcribe_audio(audio)
+        # 0) Transcribe recorded audio (append to notes)
+        transcript = transcribe_wav_bytes(st.session_state.get("recorded_audio"))
         if transcript:
             notes_raw = (notes_raw + "\n" if notes_raw else "") + transcript
 
-        # 1) Upload photos (if any)
+        # 1) Upload photos
         photo_urls = []
         if photos:
             for p in photos:
@@ -194,7 +208,7 @@ if submitted:
                 except Exception as e:
                     st.warning(f"Photo upload failed for {p.name}: {e}")
 
-        # 2) Build structured payload
+        # 2) Build row
         crew_counts = kvlist_to_json(crew_text, crew_hint=True)
         equipment = kvlist_to_json(equip_text)
         activities = []
@@ -217,15 +231,15 @@ if submitted:
             "issues_delays": issues_text,
             "safety": safety_text,
             "photos": photo_urls,
-            "notes_raw": notes_raw,   # <-- includes transcript now
+            "notes_raw": notes_raw,   # includes transcript
             "doc_url": "",
         }
 
-        # 3) Insert to Supabase
+        # 3) Insert
         try:
             supabase.table("daily_reports").insert(row).execute()
-            st.success("✅ Report saved to Supabase (with transcription if provided).")
-            reset_all_fields()
+            st.success("✅ Report saved (with transcription if recorded).")
+            reset_all_fields()     # clears recorder + form
             st.rerun()
         except Exception as e:
             st.error(f"❌ Could not insert row: {e}")
