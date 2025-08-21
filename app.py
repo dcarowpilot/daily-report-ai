@@ -3,14 +3,14 @@ from supabase import create_client
 from datetime import date, datetime
 from openai import OpenAI
 import tempfile
-from pathlib import Path
-from st_audiorec import st_audiorec  # mic recorder
+from st_audiorec import st_audiorec
 
 # -------------------------
 # CONFIG — change for your project
 # -------------------------
-BUCKET_NAME = "daily-report-photos"                # <- your bucket
-PROJECT_OPTIONS = ["Site A", "Site B", "Demo Project"]  # <- your projects
+BUCKET_PHOTOS = "daily-report-photos"       # your photos bucket
+BUCKET_AUDIO  = "daily-report-audio"        # new audio bucket
+PROJECT_OPTIONS = ["Site A", "Site B", "Demo Project"]
 
 # -------------------------
 # INIT: Supabase + OpenAI
@@ -30,17 +30,17 @@ client = get_openai()
 
 st.set_page_config(page_title="Daily Report AI", page_icon="📝")
 st.title("📝 Daily Report (MVP)")
-st.caption("Record → Whisper → review transcript • Photos → Supabase • Data → daily_reports")
+st.caption("Record → (try) Whisper → review transcript • Photos/Audio → Supabase • Data → daily_reports")
 
 # -------------------------
-# Session: nonce & audio/transcript
+# Session for resetting form / holding audio+transcript
 # -------------------------
 if "nonce" not in st.session_state:
     st.session_state["nonce"] = 0
 if "recorded_audio" not in st.session_state:
-    st.session_state["recorded_audio"] = None  # WAV bytes
+    st.session_state["recorded_audio"] = None
 if "transcript" not in st.session_state:
-    st.session_state["transcript"] = ""        # editable transcript text
+    st.session_state["transcript"] = ""
 
 def reset_all_fields():
     st.session_state["nonce"] += 1
@@ -64,13 +64,10 @@ def kvlist_to_json(s: str, kv_sep=":", item_sep=",", crew_hint=False):
     for it in items:
         if kv_sep in it:
             k, v = [x.strip() for x in it.split(kv_sep, 1)]
-            try:
-                num = int(v)
+            try: num = int(v)
             except:
-                try:
-                    num = float(v)
-                except:
-                    num = v
+                try: num = float(v)
+                except: num = v
             out.append({"trade" if crew_hint else "type": k, "count": num})
     return out
 
@@ -78,67 +75,77 @@ def qty_to_json(s: str):
     out = []
     if not s or not s.strip():
         return out
-    lines = [x.strip() for x in s.splitlines() if x.strip()]
-    for line in lines:
-        if ":" not in line:
-            continue
+    for line in [x.strip() for x in s.splitlines() if x.strip()]:
+        if ":" not in line: continue
         left, val = [x.strip() for x in line.split(":", 1)]
         parts = left.split()
         if len(parts) >= 2 and parts[-1].isalpha():
             item = " ".join(parts[:-1]); unit = parts[-1]
         else:
             item, unit = left, ""
-        try:
-            value = float(val)
-        except:
-            value = val
+        try: value = float(val)
+        except: value = val
         out.append({"item": item, "unit": unit, "value": value})
     return out
+
+def upload_bytes_to_bucket(bucket: str, path: str, data: bytes, content_type: str) -> str:
+    res = supabase.storage.from_(bucket).upload(
+        path, data, file_options={"content-type": content_type, "upsert": False}
+    )
+    if hasattr(res, "status_code") and res.status_code and res.status_code >= 400:
+        raise RuntimeError(f"Upload failed: {res}")
+    return supabase.storage.from_(bucket).get_public_url(path)
 
 def upload_photo_to_bucket(st_file, project_name: str, report_date: date) -> str:
     safe_proj = project_name.replace("/", "-")
     ts = int(datetime.utcnow().timestamp())
-    name = st_file.name
-    path = f"{report_date.isoformat()}/{safe_proj}/{ts}_{name}".replace(" ", "_")
-    file_bytes = st_file.getvalue()
-    content_type = st_file.type or "application/octet-stream"
-    res = supabase.storage.from_(BUCKET_NAME).upload(
-        path, file_bytes, file_options={"content-type": content_type, "upsert": False}
+    name = st_file.name.replace(" ", "_")
+    path = f"{report_date.isoformat()}/{safe_proj}/{ts}_{name}"
+    return upload_bytes_to_bucket(
+        BUCKET_PHOTOS, path, st_file.getvalue(), st_file.type or "application/octet-stream"
     )
-    if hasattr(res, "status_code") and res.status_code and res.status_code >= 400:
-        raise RuntimeError(f"Upload failed: {res}")
-    return supabase.storage.from_(BUCKET_NAME).get_public_url(path)
 
-def transcribe_wav_bytes(wav_bytes: bytes) -> str:
-    """Send WAV bytes to Whisper and return transcript text ("" if none)."""
+def upload_audio_bytes(project_name: str, report_date: date, wav_bytes: bytes) -> str:
+    """Uploads recorded WAV bytes; returns public URL (or '' if None)."""
     if not wav_bytes:
         return ""
+    safe_proj = project_name.replace("/", "-")
+    ts = int(datetime.utcnow().timestamp())
+    path = f"{report_date.isoformat()}/{safe_proj}/{ts}_voice.wav"
+    return upload_bytes_to_bucket(BUCKET_AUDIO, path, wav_bytes, "audio/wav")
+
+def transcribe_wav_bytes(wav_bytes: bytes) -> tuple[str, str]:
+    """
+    Try Whisper; return (text, err_code).
+    err_code can be '', 'insufficient_quota', or 'other'.
+    """
+    if not wav_bytes:
+        return "", ""
     try:
         with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
-            tmp.write(wav_bytes)
-            tmp.flush()
+            tmp.write(wav_bytes); tmp.flush()
             with open(tmp.name, "rb") as f:
-                resp = client.audio.transcriptions.create(
-                    model="whisper-1",
-                    file=f,
-                )
-        return resp.text or ""
+                resp = client.audio.transcriptions.create(model="whisper-1", file=f)
+        return (resp.text or ""), ""
     except Exception as e:
+        msg = str(e)
+        if "insufficient_quota" in msg or "429" in msg:
+            st.warning("Transcription skipped: OpenAI quota not available. Audio will be saved for later.")
+            return "", "insufficient_quota"
         st.warning(f"Transcription failed: {e}")
-        return ""
+        return "", "other"
 
 # -------------------------
-# 🎙️ Recorder + Transcript Preview
+# 🎙️ Recorder + Transcript Box
 # -------------------------
 st.subheader("🎙️ Voice note (optional)")
-st.caption("Tap to record, speak, tap again to stop. The transcript appears below and is editable before submit.")
+st.caption("Tap to record, speak, tap again to stop. Edit the transcript before submit.")
 
-recorded_bytes = st_audiorec()  # returns WAV bytes after stopping
-
-# If a fresh recording arrived, transcribe and store BEFORE rendering the form
+recorded_bytes = st_audiorec()
 if recorded_bytes and recorded_bytes != st.session_state.get("recorded_audio"):
     st.session_state["recorded_audio"] = recorded_bytes
-    text = transcribe_wav_bytes(recorded_bytes)
+    # Try to transcribe immediately so the box is prefilled
+    text, err = transcribe_wav_bytes(recorded_bytes)
     st.session_state["transcript"] = text or ""
 
 cols = st.columns([1,1,3])
@@ -152,18 +159,18 @@ with cols[1]:
             st.session_state["transcript"] = ""
             st.rerun()
 
-# Editable transcript box (pre-filled if we have one)
+# Editable transcript (may be empty if quota error)
 st.text_area(
     "Transcribed audio (editable)",
     key="transcript",
     height=120,
-    placeholder="Your transcript will appear here after recording…",
+    placeholder="Transcript will appear here after recording… (or leave empty if transcription skipped)",
 )
 
 st.divider()
 
 # -------------------------
-# UI: Form (dynamic key → resets fully on success)
+# UI: Form (dynamic key resets after save)
 # -------------------------
 FORM_KEY = f"daily_form_{st.session_state['nonce']}"
 
@@ -194,9 +201,7 @@ with st.form(FORM_KEY, clear_on_submit=False):
     issues_text = st.text_area("Issues / delays", height=80)
 
     photos = st.file_uploader(
-        "Photos",
-        type=["jpg", "jpeg", "png"],
-        accept_multiple_files=True,
+        "Photos", type=["jpg","jpeg","png"], accept_multiple_files=True,
         key=f"photos_{st.session_state['nonce']}",
     )
 
@@ -205,11 +210,11 @@ with st.form(FORM_KEY, clear_on_submit=False):
     submitted = st.form_submit_button("Submit report")
 
 if submitted:
-    with st.spinner("Uploading photos and saving report..."):
-        # 0) Take the (possibly edited) transcript from the box
-        transcript_text = st.session_state.get("transcript", "") or ""
+    with st.spinner("Saving audio/photos and inserting report..."):
+        # Upload audio regardless of transcription outcome
+        audio_url = upload_audio_bytes(project, report_date, st.session_state.get("recorded_audio"))
 
-        # 1) Upload photos (if any)
+        # 1) Upload photos
         photo_urls = []
         if photos:
             for p in photos:
@@ -219,13 +224,13 @@ if submitted:
                 except Exception as e:
                     st.warning(f"Photo upload failed for {p.name}: {e}")
 
-        # 2) Build structured payload
+        # 2) Build row
         crew_counts = kvlist_to_json(crew_text, crew_hint=True)
         equipment = kvlist_to_json(equip_text)
         activities = []
         if activities_text.strip():
-            parts = [x.strip() for x in activities_text.replace("\n", ";").split(";") if x.strip()]
-            activities = [{"location": "", "description": p} for p in parts]
+            parts = [x.strip() for x in activities_text.replace("\n",";").split(";") if x.strip()]
+            activities = [{"location":"", "description": p} for p in parts]
         quantities = qty_to_json(quantities_text)
         subs_present = str_to_list(subs_text)
 
@@ -242,15 +247,15 @@ if submitted:
             "issues_delays": issues_text,
             "safety": safety_text,
             "photos": photo_urls,
-            "notes_raw": notes_raw,          # what the user typed
-            "voice_transcript": transcript_text,  # NEW: saved separately
+            "notes_raw": notes_raw,
+            "voice_transcript": st.session_state.get("transcript", "") or "",
+            "audio_url": audio_url,
             "doc_url": "",
         }
 
-        # 3) Insert to Supabase
         try:
             supabase.table("daily_reports").insert(row).execute()
-            st.success("✅ Report saved (with editable transcript).")
+            st.success("✅ Report saved. (Transcription used if available; audio stored either way.)")
             reset_all_fields()
             st.rerun()
         except Exception as e:
