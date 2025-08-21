@@ -1,15 +1,18 @@
 import streamlit as st
 from supabase import create_client
 from datetime import date, datetime
+from openai import OpenAI
+import tempfile
+from pathlib import Path
 
 # -------------------------
 # CONFIG — change for your project
 # -------------------------
-BUCKET_NAME = "photos"          # <- your bucket name
+BUCKET_NAME = "daily-report-photos"          # <- your bucket name
 PROJECT_OPTIONS = ["Site A", "Site B", "Demo Project"]  # <- your projects
 
 # -------------------------
-# INIT: Supabase client
+# INIT: Supabase + OpenAI
 # -------------------------
 @st.cache_resource
 def get_supabase():
@@ -17,7 +20,13 @@ def get_supabase():
     key = st.secrets["SUPABASE_KEY"]
     return create_client(url, key)
 
+@st.cache_resource
+def get_openai():
+    # OPENAI_API_KEY must be in Streamlit Secrets
+    return Client(api_key=st.secrets["OPENAI_API_KEY"]) if False else OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
+
 supabase = get_supabase()
+client = get_openai()
 
 st.set_page_config(page_title="Daily Report AI", page_icon="📝")
 st.title("📝 Daily Report (MVP)")
@@ -95,6 +104,28 @@ def upload_photo_to_bucket(st_file, project_name: str, report_date: date) -> str
         raise RuntimeError(f"Upload failed: {res}")
     return supabase.storage.from_(BUCKET_NAME).get_public_url(path)
 
+def transcribe_audio(uploaded_audio) -> str:
+    """
+    Save the Streamlit UploadedFile to a temp file and call Whisper.
+    Returns transcript text (or "" on failure).
+    """
+    if not uploaded_audio:
+        return ""
+    try:
+        suffix = Path(uploaded_audio.name).suffix or ".mp3"
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            tmp.write(uploaded_audio.getvalue())
+            tmp.flush()
+            with open(tmp.name, "rb") as f:
+                resp = client.audio.transcriptions.create(
+                    model="whisper-1",
+                    file=f,
+                )
+        return resp.text or ""
+    except Exception as e:
+        st.warning(f"Transcription failed: {e}")
+        return ""
+
 # -------------------------
 # UI: Form (dynamic key)
 # -------------------------
@@ -126,7 +157,7 @@ with st.form(FORM_KEY, clear_on_submit=False):
     safety_text = st.text_area("Safety observations", height=80)
     issues_text = st.text_area("Issues / delays", height=80)
 
-    # File uploader needs a key; give it one tied to nonce
+    # Photos
     photos = st.file_uploader(
         "Photos",
         type=["jpg", "jpeg", "png"],
@@ -134,12 +165,25 @@ with st.form(FORM_KEY, clear_on_submit=False):
         key=f"photos_{st.session_state['nonce']}",
     )
 
+    # 🎙️ Voice note (m4a/mp3/wav/webm work well)
+    audio = st.file_uploader(
+        "Voice note (optional)",
+        type=["m4a", "mp3", "wav", "webm"],
+        accept_multiple_files=False,
+        key=f"audio_{st.session_state['nonce']}",
+    )
+
     notes_raw = st.text_area("Raw notes (optional)", placeholder="Paste any raw notes here", height=80)
 
     submitted = st.form_submit_button("Submit report")
 
 if submitted:
-    with st.spinner("Uploading photos and saving report..."):
+    with st.spinner("Transcribing, uploading photos, and saving report..."):
+        # 0) Transcribe voice (append to notes)
+        transcript = transcribe_audio(audio)
+        if transcript:
+            notes_raw = (notes_raw + "\n" if notes_raw else "") + transcript
+
         # 1) Upload photos (if any)
         photo_urls = []
         if photos:
@@ -169,19 +213,19 @@ if submitted:
             "equipment": equipment,
             "activities": activities,
             "quantities": quantities,
-            "subs_present": subs_present,   # jsonb recommended
+            "subs_present": subs_present,
             "issues_delays": issues_text,
             "safety": safety_text,
-            "photos": photo_urls,           # jsonb recommended
-            "notes_raw": notes_raw,
+            "photos": photo_urls,
+            "notes_raw": notes_raw,   # <-- includes transcript now
             "doc_url": "",
         }
 
         # 3) Insert to Supabase
         try:
             supabase.table("daily_reports").insert(row).execute()
-            st.success("✅ Report saved to Supabase.")
-            reset_all_fields()  # -> new form key & new uploader key
+            st.success("✅ Report saved to Supabase (with transcription if provided).")
+            reset_all_fields()
             st.rerun()
         except Exception as e:
             st.error(f"❌ Could not insert row: {e}")
