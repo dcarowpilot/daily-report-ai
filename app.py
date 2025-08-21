@@ -130,13 +130,13 @@ def transcribe_wav_bytes(wav_bytes: bytes) -> str:
         return ""
 
 # =========================
-# RECORDER + TRANSCRIPT (both tied to nonce)
+# RECORDER + TRANSCRIPT
 # =========================
 st.subheader("🎙️ Voice note (optional)")
 st.caption("Tap to record, speak, tap again to stop. Edit the transcript before submit.")
 
-# Recorder resets when nonce changes
-recorded_bytes = st_audiorec(key=f"rec_{st.session_state['nonce']}")
+# NOTE: st_audiorec() does not accept a `key` arg; leave it bare.
+recorded_bytes = st_audiorec()
 
 if recorded_bytes and recorded_bytes != st.session_state.get("recorded_audio"):
     st.session_state["recorded_audio"] = recorded_bytes
