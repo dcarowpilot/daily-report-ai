@@ -150,7 +150,11 @@ def upload_bytes_to_bucket(bucket: str, path: str, data: bytes, content_type: st
         res = supabase.storage.from_(bucket).upload(
             path,
             data,
-            file_options={"content-type": content_type, "upsert": True},  # upsert=True avoids 409 errors
+            file_options={
+                "content-type": content_type,   # must be a string
+                "upsert": "true",               # <-- string, not bool
+                # "cache-control": "3600",      # optional example; also string
+            },
         )
         status = getattr(res, "status_code", None)
         if status and status >= 400:
