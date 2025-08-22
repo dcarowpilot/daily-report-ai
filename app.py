@@ -260,8 +260,10 @@ with cols[0]:
 with cols[1]:
     if st.session_state["recorded_audio"]:
         if st.button("Clear recording"):
+            # Reset all audio-related state and bump nonce
             reset_all_fields()
-            st.rerun()
+            st.success("Recording cleared.")
+            st.stop()  # <- end this run cleanly; Streamlit will re-run automatically
 
 # Transcript text area (dynamic key tied to nonce); read the returned value
 transcript_text = st.text_area(
