@@ -1,72 +1,10 @@
 import streamlit as st
+from supabase import create_client
 from datetime import date, datetime
-import tempfile, hashlib, json
-
-# =========================
-# SAFE-BOOT SWITCH
-# =========================
-# Use ?safe=1 in the app URL to bypass mic + LLM while we debug
-SAFE_MODE = st.query_params.get("safe", ["0"])[0] == "1"
-
-st.set_page_config(page_title="Daily Report AI (Safe Boot)", page_icon="📝")
-
-st.title("📝 Daily Report (MVP)")
-if SAFE_MODE:
-    st.warning("Safe-Boot mode is ON (mic + LLM disabled). Add `?safe=0` to re-enable once stable.")
-
-# =========================
-# IMPORTS (guarded)
-# =========================
-supabase = None
-openai_client = None
-audiorec_available = False
-llm_available = False
-
-def diag(msg): st.write("• " + msg)
-
-try:
-    from supabase import create_client
-except Exception as e:
-    st.error(f"Supabase SDK import failed: {e}")
-
-try:
-    if not SAFE_MODE:
-        from openai import OpenAI
-        llm_available = True
-except Exception as e:
-    st.warning(f"OpenAI SDK not ready (running without LLM): {e}")
-    llm_available = False
-
-try:
-    if not SAFE_MODE:
-        from st_audiorec import st_audiorec
-        audiorec_available = True
-except Exception as e:
-    st.warning(f"Audio recorder not available (running without mic): {e}")
-    audiorec_available = False
-
-# =========================
-# CLIENT INIT (guarded)
-# =========================
-@st.cache_resource
-def get_supabase():
-    return create_client(st.secrets["SUPABASE_URL"], st.secrets["SUPABASE_KEY"])
-
-@st.cache_resource
-def get_openai():
-    return OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
-
-try:
-    supabase = get_supabase()
-except Exception as e:
-    st.error(f"Supabase init failed: {e}")
-
-try:
-    if llm_available:
-        openai_client = get_openai()
-except Exception as e:
-    st.warning(f"OpenAI init failed (LLM disabled): {e}")
-    llm_available = False
+from openai import OpenAI
+from st_audiorec import st_audiorec
+import tempfile
+import hashlib
 
 # =========================
 # CONFIG (edit these)
@@ -76,6 +14,24 @@ BUCKET_AUDIO  = "daily-report-audio"
 PROJECT_OPTIONS = ["Site A", "Site B", "Demo Project"]
 
 # =========================
+# INIT CLIENTS
+# =========================
+@st.cache_resource
+def get_supabase():
+    return create_client(st.secrets["SUPABASE_URL"], st.secrets["SUPABASE_KEY"])
+
+@st.cache_resource
+def get_openai():
+    return OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
+
+supabase = get_supabase()
+openai_client = get_openai()
+
+st.set_page_config(page_title="Daily Report AI", page_icon="📝")
+st.title("📝 Daily Report (MVP)")
+st.caption("Record → Whisper → review transcript • Photos/Audio → Supabase • Data → daily_reports")
+
+# =========================
 # SESSION
 # =========================
 if "nonce" not in st.session_state:
@@ -83,13 +39,15 @@ if "nonce" not in st.session_state:
 if "recorded_audio" not in st.session_state:
     st.session_state["recorded_audio"] = None
 if "transcript_prefill" not in st.session_state:
-    st.session_state["transcript_prefill"] = ""
+    st.session_state["transcript_prefill"] = ""      # safe prefill holder (not a widget key)
 if "audio_hash" not in st.session_state:
-    st.session_state["audio_hash"] = None
+    st.session_state["audio_hash"] = None            # md5 of last processed bytes
 if "skip_record_once" not in st.session_state:
-    st.session_state["skip_record_once"] = False
+    st.session_state["skip_record_once"] = False     # ignore first recorder output after reset
 
 def reset_all_fields():
+    """Reset recorder + transcript and rebuild all widgets by bumping nonce.
+       Also ignore the first recorder output on the next run (component echo)."""
     st.session_state["recorded_audio"] = None
     st.session_state["transcript_prefill"] = ""
     st.session_state["audio_hash"] = None
@@ -97,12 +55,8 @@ def reset_all_fields():
     st.session_state["nonce"] += 1
 
 # =========================
-# HELPERS (robust)
+# HELPERS
 # =========================
-def md5_bytes(b: bytes) -> str:
-    import hashlib
-    return hashlib.md5(b).hexdigest()
-
 def str_to_list(s: str):
     if not s or not s.strip(): return []
     parts = [p.strip() for p in s.replace("\n", ",").replace(";", ",").split(",")]
@@ -125,7 +79,7 @@ def kvlist_to_json(s: str, kv_sep=":", item_sep=",", crew_hint=False):
 def qty_to_json(s: str):
     out = []
     if not s or not s.strip(): return out
-    for line in [x.strip() for x in s.splitlines() if s.strip()]:
+    for line in [x.strip() for x in s.splitlines() if x.strip()]:
         if ":" not in line: continue
         left, val = [x.strip() for x in line.split(":", 1)]
         parts = left.split()
@@ -139,10 +93,12 @@ def qty_to_json(s: str):
     return out
 
 def upload_bytes_to_bucket(bucket: str, path: str, data: bytes, content_type: str) -> str:
-    if not supabase: return ""
+    """Uploads bytes to Supabase Storage; returns public URL or ''."""
     try:
         res = supabase.storage.from_(bucket).upload(
-            path, data, file_options={"content-type": content_type, "upsert": "true"}
+            path,
+            data,
+            file_options={"content-type": content_type, "upsert": "true"},
         )
         status = getattr(res, "status_code", None)
         if status and status >= 400:
@@ -153,94 +109,53 @@ def upload_bytes_to_bucket(bucket: str, path: str, data: bytes, content_type: st
         return ""
 
 def upload_photo(st_file, project_name: str, report_date: date) -> str:
+    safe_proj = project_name.replace("/", "-")
     ts = int(datetime.utcnow().timestamp())
-    path = f"{report_date.isoformat()}/{project_name.replace('/','-')}/{ts}_{st_file.name.replace(' ','_')}"
-    return upload_bytes_to_bucket(BUCKET_PHOTOS, path, st_file.getvalue(), st_file.type or "application/octet-stream")
+    name = st_file.name.replace(" ", "_")
+    path = f"{report_date.isoformat()}/{safe_proj}/{ts}_{name}"
+    return upload_bytes_to_bucket(
+        BUCKET_PHOTOS, path, st_file.getvalue(), st_file.type or "application/octet-stream"
+    )
 
 def upload_audio_bytes(project_name: str, report_date: date, wav_bytes: bytes) -> str:
     if not wav_bytes: return ""
+    safe_proj = project_name.replace("/", "-")
     ts = int(datetime.utcnow().timestamp())
-    path = f"{report_date.isoformat()}/{project_name.replace('/','-')}/{ts}_voice.wav"
+    path = f"{report_date.isoformat()}/{safe_proj}/{ts}_voice.wav"
     return upload_bytes_to_bucket(BUCKET_AUDIO, path, wav_bytes, "audio/wav")
 
 def transcribe_wav_bytes(wav_bytes: bytes) -> str:
-    if SAFE_MODE or not llm_available or not wav_bytes: return ""
+    """Send WAV bytes to Whisper and return transcript text."""
+    if not wav_bytes: return ""
     try:
         with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
             tmp.write(wav_bytes); tmp.flush()
-            from openai import OpenAI  # ensure import within try
-            client = openai_client
             with open(tmp.name, "rb") as f:
-                resp = client.audio.transcriptions.create(model="whisper-1", file=f)
-        return getattr(resp, "text", "") or ""
+                resp = openai_client.audio.transcriptions.create(model="whisper-1", file=f)
+        return resp.text or ""
     except Exception as e:
-        st.warning(f"Transcription failed (continuing): {e}")
+        st.warning(f"Transcription failed: {e}")
         return ""
 
-def _extract_output_text(resp) -> str:
-    if hasattr(resp, "output_text"): return resp.output_text
-    try: return resp.output[0].content[0].text
-    except Exception: pass
-    try: return resp.choices[0].message.content
-    except Exception: pass
-    return ""
-
-def extract_structured_with_gpt(raw_text: str) -> dict:
-    if SAFE_MODE or not llm_available or not raw_text.strip(): return {}
-    schema = {
-        "type": "object",
-        "properties": {
-            "crew_counts": {"type": "array", "items": {"type":"object","properties":{"trade":{"type":"string"},"count":{"type":"number"}}, "required":["trade","count"]}},
-            "equipment":   {"type": "array", "items": {"type":"object","properties":{"type":{"type":"string"},"count":{"type":"number"}}, "required":["type","count"]}},
-            "activities":  {"type": "array", "items": {"type":"object","properties":{"location":{"type":"string"},"description":{"type":"string"}}, "required":["description"]}},
-            "quantities":  {"type": "array", "items": {"type":"object","properties":{"item":{"type":"string"},"unit":{"type":"string"},"value":{"type":"number"}}, "required":["item","value"]}},
-            "safety": {"type":"string"},
-            "issues_delays": {"type":"string"}
-        },
-        "required": []
-    }
-    system = "Normalize construction daily report notes into JSON matching the schema. Return ONLY JSON."
-    user = f"Notes and/or transcript:\n\n{raw_text}\n\nExtract the fields; unknowns should be empty arrays/strings."
-    try:
-        resp = openai_client.responses.create(
-            model="gpt-4o-mini",
-            input=[{"role":"system","content":system}, {"role":"user","content":user}],
-            response_format={"type":"json_schema","json_schema":{"name":"daily_report_structured","schema":schema,"strict":True}}
-        )
-        txt = _extract_output_text(resp)
-        data = json.loads(txt)
-        return {
-            "crew_counts": data.get("crew_counts", []),
-            "equipment": data.get("equipment", []),
-            "activities": data.get("activities", []),
-            "quantities": data.get("quantities", []),
-            "safety": data.get("safety", ""),
-            "issues_delays": data.get("issues_delays", ""),
-        }
-    except Exception as e:
-        st.warning(f"LLM extraction failed (continuing): {e}")
-        return {}
+def md5_bytes(b: bytes) -> str:
+    return hashlib.md5(b).hexdigest()
 
 # =========================
-# RECORDER + TRANSCRIPT (guarded)
+# RECORDER + TRANSCRIPT
 # =========================
 st.subheader("🎙️ Voice note (optional)")
 st.caption("Tap to record, speak, tap again to stop. Edit the transcript before submit.")
 
-recorded_bytes = None
-if audiorec_available and not SAFE_MODE:
-    try:
-        recorded_bytes = st_audiorec()
-    except Exception as e:
-        st.warning(f"Recorder temporarily unavailable: {e}")
-        recorded_bytes = None
-else:
-    st.info("Mic is disabled in Safe-Boot. Add `?safe=0` to the URL to enable.")
+# NOTE: st_audiorec() does not accept a key.
+recorded_bytes = st_audiorec()
 
-# Handle recorder output robustly
+# Handle recorder output robustly:
+# - Ignore the very first echo after a reset (skip_record_once)
+# - Only transcribe when the audio bytes hash changes
 if recorded_bytes:
     new_hash = md5_bytes(recorded_bytes)
     if st.session_state.get("skip_record_once"):
+        # consume the echo and do nothing
         st.session_state["skip_record_once"] = False
     elif new_hash != st.session_state.get("audio_hash"):
         st.session_state["recorded_audio"] = recorded_bytes
@@ -255,10 +170,9 @@ with cols[1]:
     if st.session_state["recorded_audio"]:
         if st.button("Clear recording"):
             reset_all_fields()
-            st.success("Recording cleared.")
-            st.stop()  # end this run cleanly; Streamlit will rerun automatically
+            st.rerun()
 
-# Transcript box (always available)
+# Transcript text area uses dynamic key tied to nonce; we read returned value
 transcript_text = st.text_area(
     "Transcribed audio (editable)",
     value=st.session_state.get("transcript_prefill", ""),
@@ -268,14 +182,9 @@ transcript_text = st.text_area(
 )
 
 st.divider()
-use_llm = st.checkbox(
-    "🔧 Auto-structure Notes + Transcript with GPT",
-    value=(not SAFE_MODE),
-    help="If on, GPT parses your free text into structured sections."
-)
 
 # =========================
-# FORM
+# FORM (dynamic key so it resets)
 # =========================
 FORM_KEY = f"daily_form_{st.session_state['nonce']}"
 
@@ -314,84 +223,50 @@ with st.form(FORM_KEY, clear_on_submit=False):
 
     submitted = st.form_submit_button("Submit report")
 
-# =========================
-# SUBMIT HANDLER (robust)
-# =========================
 if submitted:
-    try:
-        with st.spinner("Structuring (if enabled), uploading media, and saving report..."):
-            # Upload audio (even if transcript empty)
-            audio_url = upload_audio_bytes(project, report_date, st.session_state.get("recorded_audio"))
+    with st.spinner("Uploading media and saving report..."):
+        audio_url = upload_audio_bytes(project, report_date, st.session_state.get("recorded_audio"))
 
-            # Upload photos
-            photo_urls = []
-            if photos:
-                for p in photos:
-                    try:
-                        photo_urls.append(upload_photo(p, project, report_date))
-                    except Exception as e:
-                        st.warning(f"Photo upload failed for {p.name}: {e}")
+        photo_urls = []
+        if photos:
+            for p in photos:
+                try:
+                    photo_urls.append(upload_photo(p, project, report_date))
+                except Exception as e:
+                    st.warning(f"Photo upload failed for {p.name}: {e}")
 
-            # ----- LLM extraction (guarded) -----
-            combined_text = ""
-            if notes_raw and notes_raw.strip(): combined_text += notes_raw.strip() + "\n\n"
-            if transcript_text and transcript_text.strip(): combined_text += "Transcript:\n" + transcript_text.strip()
+        crew_counts = kvlist_to_json(crew_text, crew_hint=True)
+        equipment = kvlist_to_json(equip_text)
+        activities = []
+        if activities_text.strip():
+            parts = [x.strip() for x in activities_text.replace("\n",";").split(";") if x.strip()]
+            activities = [{"location":"", "description": p} for p in parts]
+        quantities = qty_to_json(quantities_text)
+        subs_present = str_to_list(subs_text)
 
-            extracted = {}
-            if use_llm and combined_text.strip():
-                extracted = extract_structured_with_gpt(combined_text)
+        row = {
+            "date": report_date.isoformat(),
+            "project": project,
+            "author": author,
+            "weather": weather,
+            "crew_counts": crew_counts,
+            "equipment": equipment,
+            "activities": activities,
+            "quantities": quantities,
+            "subs_present": subs_present,
+            "issues_delays": issues_text,
+            "safety": safety_text,
+            "photos": photo_urls,
+            "notes_raw": notes_raw,
+            "voice_transcript": transcript_text,
+            "audio_url": audio_url,
+            "doc_url": "",
+        }
 
-            # Merge manual inputs with extracted
-            crew_counts_final = kvlist_to_json(crew_text, crew_hint=True) or extracted.get("crew_counts", [])
-            equipment_final   = kvlist_to_json(equip_text)                or extracted.get("equipment", [])
-            if activities_text.strip():
-                parts = [x.strip() for x in activities_text.replace("\n",";").split(";") if x.strip()]
-                activities_final = [{"location":"", "description": p} for p in parts]
-            else:
-                activities_final = extracted.get("activities", [])
-            quantities_final  = qty_to_json(quantities_text)              or extracted.get("quantities", [])
-            safety_final      = safety_text or extracted.get("safety", "")
-            issues_final      = issues_text or extracted.get("issues_delays", "")
-
-            subs_present = str_to_list(subs_text)
-
-            row = {
-                "date": report_date.isoformat(),
-                "project": project,
-                "author": author,
-                "weather": weather,
-                "crew_counts": crew_counts_final,
-                "equipment": equipment_final,
-                "activities": activities_final,
-                "quantities": quantities_final,
-                "subs_present": subs_present,
-                "issues_delays": issues_final,
-                "safety": safety_final,
-                "photos": photo_urls,
-                "notes_raw": notes_raw,
-                "voice_transcript": transcript_text,
-                "audio_url": audio_url,
-                "doc_url": "",
-            }
-
-            if not supabase:
-                st.error("Supabase not initialized; cannot save row.")
-            else:
-                supabase.table("daily_reports").insert(row).execute()
-                st.success("✅ Report saved.")
-                reset_all_fields()
-                st.stop()  # clean stop; Streamlit will re-run automatically
-
-    except Exception as e:
-        st.error(f"App error (continuing in Safe-Boot): {e}")
-
-# =========================
-# DIAGNOSTICS (toggle)
-# =========================
-with st.expander("App health / diagnostics"):
-    diag(f"SAFE_MODE: {SAFE_MODE}")
-    diag(f"Supabase client: {'OK' if supabase else 'NOT READY'}")
-    diag(f"OpenAI client: {'OK' if (openai_client and llm_available and not SAFE_MODE) else 'disabled'}")
-    diag(f"Recorder available: {audiorec_available and not SAFE_MODE}")
-    diag(f"Secrets present: {all(k in st.secrets for k in ['SUPABASE_URL','SUPABASE_KEY'])} (Supabase), {'OPENAI_API_KEY' in st.secrets} (OpenAI)")
-    diag(f"Buckets: photos='{BUCKET_PHOTOS}', audio='{BUCKET_AUDIO}'")
+        try:
+            supabase.table("daily_reports").insert(row).execute()
+            st.success("✅ Report saved (with photos/audio + transcript).")
+            reset_all_fields()     # clears recorder + transcript + form via nonce
+            st.rerun()
+        except Exception as e:
+            st.error(f"❌ Could not insert row: {e}")
