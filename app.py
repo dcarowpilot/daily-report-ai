@@ -107,6 +107,86 @@ def reset_all_fields():
 # =========================
 # Helpers
 # =========================
+import re
+
+NUMBER_WORDS = {
+    "zero": 0, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+    "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
+    "eleven": 11, "twelve": 12, "thirteen": 13, "fourteen": 14,
+    "fifteen": 15, "sixteen": 16, "seventeen": 17, "eighteen": 18,
+    "nineteen": 19, "twenty": 20
+}
+
+# common trades (singular) → how to display in the report (usually plural)
+TRADE_DISPLAY = {
+    "carpenter": "Carpenters",
+    "ironworker": "Ironworkers",
+    "laborer": "Laborers",
+    "electrician": "Electricians",
+    "plumber": "Plumbers",
+    "pipefitter": "Pipefitters",
+    "operator": "Operators",
+    "teamster": "Teamsters",
+    "welder": "Welders",
+    "mason": "Masons",
+    "concrete finisher": "Concrete Finishers",
+    "roofer": "Roofers",
+    "painter": "Painters",
+    "insulator": "Insulators",
+    "sheet metal worker": "Sheet Metal Workers",
+    "millwright": "Millwrights"
+}
+
+def _normalize_trade(word: str) -> str:
+    w = word.strip().lower()
+    # handle multi-word trades in text by matching longest first later if needed
+    if w in TRADE_DISPLAY:
+        return TRADE_DISPLAY[w]
+    # basic pluralization fallback
+    w_cap = w.capitalize()
+    if not w.endswith("s"):
+        w_cap += "s"
+    return w_cap
+
+def _number_from_token(tok: str) -> int | None:
+    tok = tok.lower()
+    if tok.isdigit():
+        return int(tok)
+    return NUMBER_WORDS.get(tok)
+
+def fallback_extract_from_text(raw_text: str) -> dict:
+    """
+    Very small rule-based extractor for crew counts:
+    - matches "<num> <trade>(s)" or "<number word> <trade>(s)"
+    - returns {"crew_counts": [{"trade": "...", "count": N}, ...]}
+    """
+    if not raw_text or not raw_text.strip():
+        return {}
+
+    text = raw_text.lower()
+    results = {}
+
+    # match patterns like "six ironworkers", "6 ironworkers", "3 carpenter(s)"
+    pattern = re.compile(
+        r"\b(?P<num>(?:\d+|zero|one|two|three|four|five|six|seven|eight|nine|ten|"
+        r"eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty))\s+"
+        r"(?P<trade>(?:sheet\s+metal\s+worker|concrete\s+finisher|pipefitter|ironworker|carpenter|laborer|"
+        r"electrician|plumber|operator|teamster|welder|mason|roofer|painter|insulator|millwright))s?\b"
+    )
+
+    for m in pattern.finditer(text):
+        num_tok = m.group("num")
+        trade_tok = m.group("trade")
+        num_val = _number_from_token(num_tok)
+        if num_val is None:
+            continue
+        trade_disp = _normalize_trade(trade_tok)
+        # combine duplicates by summing
+        results[trade_disp] = results.get(trade_disp, 0) + num_val
+
+    crew = [{"trade": t, "count": c} for t, c in results.items()]
+    return {"crew_counts": crew} if crew else {}
+
 def md5_bytes(b: bytes) -> str:
     return hashlib.md5(b).hexdigest()
 
@@ -214,7 +294,8 @@ def _extract_output_text(resp) -> str:
     return ""
 
 def extract_structured_with_gpt(raw_text: str) -> dict:
-    if SAFE_MODE or not llm_available or not raw_text.strip(): return {}
+    if SAFE_MODE or not llm_available or not raw_text.strip():
+        return {}
     schema = {
         "type": "object",
         "properties": {
@@ -227,8 +308,21 @@ def extract_structured_with_gpt(raw_text: str) -> dict:
         },
         "required": []
     }
-    system = "Normalize construction daily report notes into JSON matching the schema. Return ONLY JSON."
-    user = f"Notes/transcript:\n\n{raw_text}\n\nExtract the fields; unknowns should be empty arrays/strings."
+    system = (
+        "You normalize construction daily report notes into JSON matching the schema. "
+        "Convert number words to numbers (e.g., 'six'→6). "
+        "Map trades to their common names (e.g., 'ironworker' → 'Ironworkers'). "
+        "Return ONLY JSON; omit sections you cannot infer."
+    )
+    # Two tiny examples to bias the model
+    examples = (
+        "Examples:\n"
+        "- Input: 'There were six ironworkers today.' → crew_counts: [{trade:'Ironworkers', count:6}]\n"
+        "- Input: '3 carpenters and one operator on site.' → crew_counts: "
+        "[{trade:'Carpenters', count:3}, {trade:'Operators', count:1}]"
+    )
+    user = f"{examples}\n\nNotes/transcript:\n\n{raw_text}\n\nExtract fields; unknowns as empty arrays/strings."
+
     try:
         resp = openai_client.responses.create(
             model="gpt-4o-mini",
@@ -278,9 +372,16 @@ if recorded_bytes:
         transcript = transcribe_wav_bytes(recorded_bytes) or ""
         st.session_state["transcript_prefill"] = transcript
 
-        # 2) Auto-extract from transcript to prefill the form
+        # 2) Auto-extract from transcript
         extracted = extract_structured_with_gpt(transcript) if transcript.strip() else {}
 
+        # ---- NEW: rule-based fallback if GPT gave nothing for crew ----
+        if not extracted.get("crew_counts"):
+            fb = fallback_extract_from_text(transcript)
+            if fb.get("crew_counts"):
+                extracted["crew_counts"] = fb["crew_counts"]
+
+        # 3) Populate prefill states for the form fields
         st.session_state["crew_prefill"]   = crew_to_text(extracted.get("crew_counts", []))
         st.session_state["equip_prefill"]  = equip_to_text(extracted.get("equipment", []))
         st.session_state["acts_prefill"]   = acts_to_text(extracted.get("activities", []))
@@ -288,7 +389,7 @@ if recorded_bytes:
         st.session_state["safety_prefill"] = extracted.get("safety", "")
         st.session_state["issues_prefill"] = extracted.get("issues_delays", "")
 
-        # 3) Rebuild widgets with new values
+        # 4) Rebuild widgets with new values
         st.session_state["nonce"] += 1
         st.rerun()
 
