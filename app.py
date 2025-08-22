@@ -8,7 +8,7 @@ import tempfile, hashlib, json
 SAFE_MODE = st.query_params.get("safe", ["0"])[0] == "1"
 
 st.set_page_config(page_title="Daily Report AI", page_icon="📝")
-st.title("📝 Daily Report (MVP)")
+st.title("📝 Daily Report TestZ (MVP)")
 if SAFE_MODE:
     st.warning("Safe-Boot mode is ON (mic + LLM disabled). Add `?safe=0` to re-enable.")
 
