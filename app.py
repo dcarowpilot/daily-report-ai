@@ -4,6 +4,7 @@ from datetime import date, datetime
 from openai import OpenAI
 from st_audiorec import st_audiorec
 import tempfile
+import hashlib
 
 # =========================
 # CONFIG (edit these)
@@ -38,12 +39,19 @@ if "nonce" not in st.session_state:
 if "recorded_audio" not in st.session_state:
     st.session_state["recorded_audio"] = None
 if "transcript_prefill" not in st.session_state:
-    st.session_state["transcript_prefill"] = ""   # safe prefill holder (not a widget key)
+    st.session_state["transcript_prefill"] = ""      # safe prefill holder (not a widget key)
+if "audio_hash" not in st.session_state:
+    st.session_state["audio_hash"] = None            # md5 of last processed bytes
+if "skip_record_once" not in st.session_state:
+    st.session_state["skip_record_once"] = False     # ignore first recorder output after reset
 
 def reset_all_fields():
-    """Reset recorder + transcript and rebuild all widgets by bumping nonce."""
+    """Reset recorder + transcript and rebuild all widgets by bumping nonce.
+       Also ignore the first recorder output on the next run (component echo)."""
     st.session_state["recorded_audio"] = None
     st.session_state["transcript_prefill"] = ""
+    st.session_state["audio_hash"] = None
+    st.session_state["skip_record_once"] = True
     st.session_state["nonce"] += 1
 
 # =========================
@@ -129,19 +137,30 @@ def transcribe_wav_bytes(wav_bytes: bytes) -> str:
         st.warning(f"Transcription failed: {e}")
         return ""
 
+def md5_bytes(b: bytes) -> str:
+    return hashlib.md5(b).hexdigest()
+
 # =========================
 # RECORDER + TRANSCRIPT
 # =========================
 st.subheader("🎙️ Voice note (optional)")
 st.caption("Tap to record, speak, tap again to stop. Edit the transcript before submit.")
 
-# NOTE: st_audiorec() does not accept a `key` arg; leave it bare.
+# NOTE: st_audiorec() does not accept a key.
 recorded_bytes = st_audiorec()
 
-if recorded_bytes and recorded_bytes != st.session_state.get("recorded_audio"):
-    st.session_state["recorded_audio"] = recorded_bytes
-    # Set transcript prefill (safe; not a widget key)
-    st.session_state["transcript_prefill"] = transcribe_wav_bytes(recorded_bytes) or ""
+# Handle recorder output robustly:
+# - Ignore the very first echo after a reset (skip_record_once)
+# - Only transcribe when the audio bytes hash changes
+if recorded_bytes:
+    new_hash = md5_bytes(recorded_bytes)
+    if st.session_state.get("skip_record_once"):
+        # consume the echo and do nothing
+        st.session_state["skip_record_once"] = False
+    elif new_hash != st.session_state.get("audio_hash"):
+        st.session_state["recorded_audio"] = recorded_bytes
+        st.session_state["audio_hash"] = new_hash
+        st.session_state["transcript_prefill"] = transcribe_wav_bytes(recorded_bytes) or ""
 
 cols = st.columns([1,1,3])
 with cols[0]:
@@ -239,7 +258,7 @@ if submitted:
             "safety": safety_text,
             "photos": photo_urls,
             "notes_raw": notes_raw,
-            "voice_transcript": transcript_text,   # read from returned variable
+            "voice_transcript": transcript_text,
             "audio_url": audio_url,
             "doc_url": "",
         }
