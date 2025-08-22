@@ -5,6 +5,7 @@ from openai import OpenAI
 from st_audiorec import st_audiorec
 import tempfile
 import hashlib
+import json
 
 # =========================
 # CONFIG (edit these)
@@ -29,7 +30,7 @@ openai_client = get_openai()
 
 st.set_page_config(page_title="Daily Report AI", page_icon="📝")
 st.title("📝 Daily Report (MVP)")
-st.caption("Record → Whisper → review transcript • Photos/Audio → Supabase • Data → daily_reports")
+st.caption("Record → Whisper → review transcript • Auto-structure with GPT • Photos/Audio → Supabase • Data → daily_reports")
 
 # =========================
 # SESSION
@@ -43,7 +44,7 @@ if "transcript_prefill" not in st.session_state:
 if "audio_hash" not in st.session_state:
     st.session_state["audio_hash"] = None            # md5 of last processed bytes
 if "skip_record_once" not in st.session_state:
-    st.session_state["skip_record_once"] = False     # ignore first recorder output after reset
+    st.session_state["skip_record_once"] = False     # ignore first recorder echo after reset
 
 def reset_all_fields():
     """Reset recorder + transcript and rebuild all widgets by bumping nonce.
@@ -140,22 +141,112 @@ def transcribe_wav_bytes(wav_bytes: bytes) -> str:
 def md5_bytes(b: bytes) -> str:
     return hashlib.md5(b).hexdigest()
 
+# -------------------------
+# LLM extraction helpers
+# -------------------------
+def _extract_output_text(resp) -> str:
+    """Be tolerant of SDK return shapes; try a few ways to get text."""
+    if hasattr(resp, "output_text"):
+        return resp.output_text
+    try:
+        return resp.output[0].content[0].text
+    except Exception:
+        pass
+    try:
+        return resp.choices[0].message.content
+    except Exception:
+        pass
+    return ""
+
+def extract_structured_with_gpt(client, raw_text: str) -> dict:
+    """
+    Calls GPT to convert messy notes/transcripts into normalized JSON.
+    Returns a dict with keys: crew_counts, equipment, activities, quantities, safety, issues_delays
+    """
+    if not raw_text or not raw_text.strip():
+        return {}
+
+    schema = {
+        "type": "object",
+        "properties": {
+            "crew_counts": {"type": "array", "items": {
+                "type": "object",
+                "properties": {"trade": {"type": "string"}, "count": {"type": "number"}},
+                "required": ["trade", "count"]
+            }},
+            "equipment": {"type": "array", "items": {
+                "type": "object",
+                "properties": {"type": {"type": "string"}, "count": {"type": "number"}},
+                "required": ["type", "count"]
+            }},
+            "activities": {"type": "array", "items": {
+                "type": "object",
+                "properties": {"location": {"type": "string"}, "description": {"type": "string"}},
+                "required": ["description"]
+            }},
+            "quantities": {"type": "array", "items": {
+                "type": "object",
+                "properties": {"item": {"type": "string"}, "unit": {"type": "string"}, "value": {"type": "number"}},
+                "required": ["item", "value"]
+            }},
+            "safety": {"type": "string"},
+            "issues_delays": {"type": "string"}
+        },
+        "required": []
+    }
+
+    system = (
+        "You normalize construction daily report notes into a concise JSON summary. "
+        "Infer only when explicit; otherwise omit. Keep units simple (CY, LF, SF). "
+        "Return ONLY JSON matching the provided schema."
+    )
+    user = (
+        "Free-form notes (may include transcript snippets):\n\n"
+        f"{raw_text}\n\n"
+        "Extract: crew_counts (trade,count), equipment (type,count), activities (location,description), "
+        "quantities (item,unit,value), safety (string), issues_delays (string). "
+        "If unknown, use empty arrays/strings."
+    )
+
+    try:
+        resp = client.responses.create(
+            model="gpt-4o-mini",
+            input=[{"role": "system", "content": system},
+                   {"role": "user", "content": user}],
+            response_format={
+                "type": "json_schema",
+                "json_schema": {"name": "daily_report_structured", "schema": schema, "strict": True},
+            },
+        )
+        text = _extract_output_text(resp)
+        data = json.loads(text)
+        return {
+            "crew_counts": data.get("crew_counts", []),
+            "equipment": data.get("equipment", []),
+            "activities": data.get("activities", []),
+            "quantities": data.get("quantities", []),
+            "safety": data.get("safety", ""),
+            "issues_delays": data.get("issues_delays", ""),
+        }
+    except Exception as e:
+        st.warning(f"LLM extraction failed: {e}")
+        return {}
+
 # =========================
 # RECORDER + TRANSCRIPT
 # =========================
 st.subheader("🎙️ Voice note (optional)")
 st.caption("Tap to record, speak, tap again to stop. Edit the transcript before submit.")
 
-# NOTE: st_audiorec() does not accept a key.
+# Recorder (no key)
 recorded_bytes = st_audiorec()
 
 # Handle recorder output robustly:
-# - Ignore the very first echo after a reset (skip_record_once)
+# - Ignore the first echo after a reset (skip_record_once)
 # - Only transcribe when the audio bytes hash changes
 if recorded_bytes:
     new_hash = md5_bytes(recorded_bytes)
     if st.session_state.get("skip_record_once"):
-        # consume the echo and do nothing
         st.session_state["skip_record_once"] = False
     elif new_hash != st.session_state.get("audio_hash"):
         st.session_state["recorded_audio"] = recorded_bytes
@@ -172,7 +263,7 @@ with cols[1]:
             reset_all_fields()
             st.rerun()
 
-# Transcript text area uses dynamic key tied to nonce; we read returned value
+# Transcript text area (dynamic key tied to nonce); read the returned value
 transcript_text = st.text_area(
     "Transcribed audio (editable)",
     value=st.session_state.get("transcript_prefill", ""),
@@ -182,6 +273,10 @@ transcript_text = st.text_area(
 )
 
 st.divider()
+use_llm = st.checkbox(
+    "🔧 Auto-structure Notes + Transcript with GPT", value=True,
+    help="If on, GPT will parse your free text into crew/equipment/activities/quantities/safety/issues."
+)
 
 # =========================
 # FORM (dynamic key so it resets)
@@ -224,9 +319,11 @@ with st.form(FORM_KEY, clear_on_submit=False):
     submitted = st.form_submit_button("Submit report")
 
 if submitted:
-    with st.spinner("Uploading media and saving report..."):
+    with st.spinner("Structuring (if enabled), uploading media, and saving report..."):
+        # Upload audio (even if transcript empty)
         audio_url = upload_audio_bytes(project, report_date, st.session_state.get("recorded_audio"))
 
+        # Upload photos
         photo_urls = []
         if photos:
             for p in photos:
@@ -235,27 +332,50 @@ if submitted:
                 except Exception as e:
                     st.warning(f"Photo upload failed for {p.name}: {e}")
 
-        crew_counts = kvlist_to_json(crew_text, crew_hint=True)
-        equipment = kvlist_to_json(equip_text)
-        activities = []
+        # ---------- LLM extraction ----------
+        combined_text = ""
+        if notes_raw and notes_raw.strip():
+            combined_text += notes_raw.strip() + "\n\n"
+        if transcript_text and transcript_text.strip():
+            combined_text += "Transcript:\n" + transcript_text.strip()
+
+        extracted = {}
+        if use_llm and combined_text.strip():
+            with st.spinner("Structuring text with GPT…"):
+                extracted = extract_structured_with_gpt(openai_client, combined_text)
+
+        # (Optional) preview the extracted JSON
+        if extracted:
+            with st.expander("Preview extracted JSON"):
+                st.json(extracted)
+
+        # ---------- Merge manual inputs with extracted ----------
+        crew_counts_final = kvlist_to_json(crew_text, crew_hint=True) or extracted.get("crew_counts", [])
+        equipment_final   = kvlist_to_json(equip_text)                or extracted.get("equipment", [])
         if activities_text.strip():
             parts = [x.strip() for x in activities_text.replace("\n",";").split(";") if x.strip()]
-            activities = [{"location":"", "description": p} for p in parts]
-        quantities = qty_to_json(quantities_text)
+            activities_final = [{"location":"", "description": p} for p in parts]
+        else:
+            activities_final = extracted.get("activities", [])
+        quantities_final  = qty_to_json(quantities_text)              or extracted.get("quantities", [])
+        safety_final      = safety_text or extracted.get("safety", "")
+        issues_final      = issues_text or extracted.get("issues_delays", "")
+
         subs_present = str_to_list(subs_text)
 
+        # ---------- Insert row ----------
         row = {
             "date": report_date.isoformat(),
             "project": project,
             "author": author,
             "weather": weather,
-            "crew_counts": crew_counts,
-            "equipment": equipment,
-            "activities": activities,
-            "quantities": quantities,
+            "crew_counts": crew_counts_final,
+            "equipment": equipment_final,
+            "activities": activities_final,
+            "quantities": quantities_final,
             "subs_present": subs_present,
-            "issues_delays": issues_text,
-            "safety": safety_text,
+            "issues_delays": issues_final,
+            "safety": safety_final,
             "photos": photo_urls,
             "notes_raw": notes_raw,
             "voice_transcript": transcript_text,
@@ -265,8 +385,8 @@ if submitted:
 
         try:
             supabase.table("daily_reports").insert(row).execute()
-            st.success("✅ Report saved (with photos/audio + transcript).")
-            reset_all_fields()     # clears recorder + transcript + form via nonce
+            st.success("✅ Report saved (photos/audio + transcript, with GPT structuring if enabled).")
+            reset_all_fields()
             st.rerun()
         except Exception as e:
             st.error(f"❌ Could not insert row: {e}")
